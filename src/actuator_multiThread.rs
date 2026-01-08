@@ -1,193 +1,131 @@
-use std::sync::{mpsc, Arc, Mutex};
-use std::collections::HashMap;
-use crossbeam::channel::{self, Receiver, Sender, select};
+use std::ops::Deref;
+use std::sync::{Arc, Mutex};
+use crossbeam::channel::{Receiver, Sender};
 use std::thread;
-use std::thread::Thread;
 use std::time::{Duration, Instant};
-use tokio::sync::broadcast;
-use crate::share::{ActuatorStatus, Feedback, PidController, SensorData, SensorFeedback, SensorType, SystemLog};
+use rand::Rng;
+use crate::share::{ActuatorStatus, BenchmarkStats, Feedback, SensorData, SensorFeedback, SensorType, SystemLog, SystemMode};
 
-pub struct ActuatorCommander {
-    pids: HashMap<SensorType, PidController>,
-    log: Arc<Mutex<SystemLog>>,
-    actuator_channels: HashMap<SensorType, Sender<f64>>,
-    sensor_feedback_tx: HashMap<SensorType,Sender<SensorFeedback>>,
-}
-
-impl ActuatorCommander {
-    pub fn new(sensor_feedback_tx: HashMap<SensorType,Sender<SensorFeedback>>, log: Arc<Mutex<SystemLog>>) -> Self {
-        let mut pids = HashMap::new();
-
-        pids.insert(SensorType::Force, PidController::new(1.5, 0.1, 0.05));
-        pids.insert(SensorType::Position, PidController::new(0.8, 0.2, 0.1));
-        pids.insert(SensorType::Temperature, PidController::new(0.5, 0.05, 0.01));
-        Self { pids, sensor_feedback_tx, log, actuator_channels: HashMap::new() }
-    }
-
-
-    fn process_data(&mut self, data:SensorData){
-        let start = Instant::now();
-
-        // 1. Fault Tolerance
-        if data.anomaly{
-            // let _ = self.tx_feedback.send(Feedback::EmergencyStop);
-            let mut log = self.log.lock().unwrap();
-            log.write(format!("[E-STOP] Anomaly detected on {:?}. System halted.", data.sensor_type));
-            return;
-        }
-
-        // 2. PID
-        let setpoint = match data.sensor_type {
-            SensorType::Force => 30.0,
-            SensorType::Position => 0.0,
-            SensorType::Temperature => 240.0,
-        };
-
-        if let Some(pid) = self.pids.get_mut(&data.sensor_type){
-            let effort = pid.compute(setpoint, data.value, 0.005);
-
-            // --- Route to Specific Actuator ---
-            if let Some(actuator_tx) = self.actuator_channels.get(&data.sensor_type) {
-                // Send the command to the specific thread
-                actuator_tx.send(effort).unwrap();
-            }
-        }
-
-    }
-
-    fn handle_message(&mut self, msg_result: Result<SensorData, channel::RecvError>)->bool {
-        match msg_result {
-            Ok(data) => {
-                self.process_data(data);
-                true // Continue running
-            }
-            Err(_) => {
-                // channel is closed, we should stop to avoid infinite loop
-                false // Stop running
-            }
-        }
-    }
-
-    fn spawn_actuators(&mut self) -> Receiver<ActuatorStatus> {
-        let (status_tx, status_rx) = channel::unbounded();
-
-        let actuators = vec![
-            ("Motor", SensorType::Force),
-            ("Gripper", SensorType::Position),
-            ("Stabiliser", SensorType::Temperature),
-        ];
-
-        for (name, sensor_type) in actuators {
-            let (cmd_tx, cmd_rx) = channel::unbounded();
-            self.actuator_channels.insert(sensor_type, cmd_tx);
-
-            // Clone the status transmitter for this actuator
-            let my_status_tx = status_tx.clone();
-
-            let mut actuator = Actuator::new(name.to_string(), sensor_type);
-
-            thread::spawn(move || {
-                actuator.run(cmd_rx, my_status_tx);
-            });
-        }
-        status_rx // Return the receiver so Commander can listen
-    }
-
-    fn process_actuator_status(&mut self, status: ActuatorStatus) {
-        match status {
-            ActuatorStatus::ActionComplete { sensor_type, effort } => {
-                // Logic: If effort was huge, tell sensor to recalibrate (simulated)
-                if effort.abs() > 10.0 {
-                    if let Some(fb_tx) = self.sensor_feedback_tx.get(&sensor_type) {
-                        // Send feedback to SENSOR
-                        let _ = fb_tx.send(SensorFeedback::Recalibrate { offset: -1.0 });
-                        // println!("Feedback sent to {:?}", sensor_type);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    pub fn run(
-        mut self,
-        rx_force: Receiver<SensorData>,
-        rx_pos: Receiver<SensorData>,
-        rx_temp: Receiver<SensorData>, )
-    {
-
-        let rx_status = self.spawn_actuators();
-
-        println!("Commander: System Active. Listening for sensor data...");
-
-        let mut active = true;
-
-        while active {
-            select! {
-                recv(rx_force) -> msg => { active = self.handle_message(msg); },
-                recv(rx_pos) -> msg => { active = self.handle_message(msg); },
-                recv(rx_temp) -> msg => { active = self.handle_message(msg); },
-            }
-
-            // Optional: Also check the SystemLog active flag to be safe
-            if let Ok(log) = self.log.lock() {
-                if !log.active { break; }
-            }
-        }
-
-        // loop {
-        //     // CROSSBEAM SELECT!
-        //     // This blocks until ANY one of the channels receives a message.
-        //     select! {
-        //         recv(rx_force) -> msg => self.handle_message(msg),
-        //         recv(rx_pos) -> msg => self.handle_message(msg),
-        //         recv(rx_temp) -> msg => self.handle_message(msg),
-        //
-        //         // B. Handle Actuator Status -> Send Feedback to Sensor
-        //         recv(rx_status) -> msg => {
-        //              if let Ok(status) = msg {
-        //                  self.process_actuator_status(status);
-        //              }
-        //         }
-        //     }
-        // }
-    }
-
-}
-
-struct Actuator{
+pub struct Actuator{
     name: String,
-    sensor_type: SensorType
+    sensor_type: SensorType,
+    operation_deadline:Duration,
+    log:Arc<Mutex<SystemLog>>,
+    benchmark_stats: BenchmarkStats,
+    last_arrival_time: Option<Instant>,
 }
 
 impl Actuator{
+    pub fn new(name: String, sensor_type: SensorType, log: Arc<Mutex<SystemLog>>,) -> Self {
 
-    fn new(name: String, sensor_type: SensorType) -> Self {
-        Self { name, sensor_type }
+        // 1. Determine the operation deadline
+        let deadline = match sensor_type {
+            SensorType::Force => Duration::from_micros(2000),
+            SensorType::Position => Duration::from_micros(2000),
+            SensorType::Temperature => Duration::from_micros(2000),
+        };
+
+        Self{name, sensor_type, operation_deadline: deadline, log, benchmark_stats: BenchmarkStats::new(), last_arrival_time:None}
     }
 
-    fn run(&mut self, rx:Receiver<f64>,tx_status: Sender<ActuatorStatus>){
+    fn update_jitter(&mut self) {
 
-        while let Ok(effort) = rx.recv() {
-            let start = Instant::now();
+        let current_time = Instant::now();
 
-            // Simulate Actuation
-            println!("Actuator [{}] adjusting to effort {:.2}", self.name, effort);
+        // 1. Check if we have a previous packet time to compare against
+        if let Some(last_time) = self.last_arrival_time{
+            let interval = current_time.duration_since(last_time);
 
-            // Simulate hardware delay (1ms)
-            thread::sleep(Duration::from_micros(50));
+            // Define expected rate (Consider making this a constant or struct field later)
+            let expected_interval = Duration::from_millis(5);
 
-            // Optional: Check if we met the deadline (Source: 58)
-            if start.elapsed() > Duration::from_millis(2) {
-                println!("Warning: Actuator [{}] deadline missed!", self.name);
+            // Calculate absolute difference (Jitter)
+            let jitter = if interval > expected_interval {
+                interval - expected_interval
+            } else {
+                expected_interval - interval
+            };
+
+            // Update Stats
+            self.benchmark_stats.total_at_jitter += jitter;
+            if jitter > self.benchmark_stats.max_at_jitter {
+                self.benchmark_stats.max_at_jitter = jitter;
+            }
+        }
+        self.last_arrival_time = Some(current_time);
+    }
+
+    fn generate_feedback(&self) -> Feedback {
+        let mut rng = rand::rng();
+
+        // Roll dice (0.0 to 1.0)
+        let normal: bool = rng.random_bool(0.95);
+
+        // 95% Chance: Everything is fine (Ack)
+        if normal {
+            Feedback {
+                is_ack: true,
+                error_msg: "no".to_string(),
+                recalibrate_offset: 0.0,
+                timestamp: Instant::now(),
+            }
+        } else {
+            // 5% Chance: Randomly request a sensor adjustment
+            let random_offset = rng.random_range(-0.5..0.5);
+
+            // Log this command so you can trace it in the report
+            if let Ok(mut guard) = self.log.lock() {
+                guard.write(format!("[Command] Actuator [{}] req offset: {:.4}", self.name, random_offset));
             }
 
-            let _ = tx_status.send(ActuatorStatus::ActionComplete {
-                sensor_type: self.sensor_type,
-                effort,
-            });
+            Feedback {
+                is_ack: false,
+                error_msg: "Random Drift Check".to_string(),
+                recalibrate_offset: random_offset,
+                timestamp: Instant::now(),
+            }
         }
+    }
 
+    pub fn run(&mut self, sensor_data:Receiver<SensorData>,tx_status: Sender<Feedback>,
+    )-> BenchmarkStats{
+
+        // 1. Receive Value from commander
+        while let Ok(data) = sensor_data.recv() {
+
+            self.update_jitter();
+
+            // 2. Start to record processing time
+            let start = Instant::now();
+
+            // 3. Simulate Actuation
+            println!("Actuator [{}] adjusting to effort {:.2}", self.name, data.value);
+            thread::sleep(Duration::from_micros(100));
+
+            // 4. Check deadline for the
+            let operation_duration = start.elapsed();
+            if operation_duration > self.operation_deadline {
+                if let Ok(mut log_guard) = self.log.lock() {
+                    log_guard.write(format!("[Deadline] Actuator [{}] missed deadline by {:?} ms", self.name, operation_duration-self.operation_deadline));
+                }
+                self.benchmark_stats.actuator_missed_deadlines += 1;
+            }
+
+            // 5. Generate feedback
+            let feedback = self.generate_feedback();
+
+            // 6. Send feedback
+            if feedback.recalibrate_offset != 0.0 {
+                let _ = tx_status.send(feedback);
+            }
+            
+            let now = Instant::now();
+            let e2e_latency = now.duration_since(data.timestamp);
+
+            self.benchmark_stats.total_latency += e2e_latency;
+            self.benchmark_stats.actuator_count += 1;
+        }
+        self.benchmark_stats
     }
 
 
