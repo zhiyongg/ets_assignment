@@ -1,34 +1,116 @@
 
-mod share;
-mod sensor_tokio;
-mod actuator3;
-mod sensor_multiThread;
-mod actuator_multiThread;
-
 use std::collections::HashMap;
-// use tokio::sync::{mpsc, broadcast, Mutex};
-use std::sync::{mpsc, Arc, Mutex};
-use std::thread;
+use tokio::sync::Mutex;
+use std::sync::Arc;
 use std::time::Duration;
-use crossbeam::channel::unbounded;
-use rts_assignment::run_simulation;
-use crate::actuator_multiThread::ActuatorCommander;
-use crate::share::{SensorType, SystemLog};
-use crate::sensor_multiThread::Sensor;
-// use tokio::time::{self, Duration};
+use tokio::sync::mpsc;
 
+use rts_assignment::share::{BenchmarkStats, SensorType, SystemLog};
+use rts_assignment::sensor_async::SensorAsync;
+use rts_assignment::actuator_async::ActuatorAsync;
+use rts_assignment::actuator_commander_async::ActuatorCommanderAsync;
+use rts_assignment::print_report;
 
-fn main() {
-
-    // Run for the full 2 seconds required for the demo
-    run_simulation(Duration::from_secs(2));
-
-}
+// fn main() {
+//
+//     // Run for the full 2 seconds required for the demo
+//     run_simulation(Duration::from_secs(2));
+//
+// }
 
 
 
 
 //===============================Tokio Main===========================
+#[tokio::main]
+async fn main() {
+    println!("=== Starting Async Real-Time Simulation (Tokio) ===");
+
+    // 1. Setup Shared Logging
+    let system_log = Arc::new(Mutex::new(SystemLog::new()));
+    let mut benchmark_stats = BenchmarkStats::new();
+
+    // 2. Create Channels (Buffer size 32 is sufficient for real-time)
+    // SENSORS -> COMMANDER
+    let (tx_force, rx_force) = mpsc::channel(32);
+    let (tx_pos, rx_pos) = mpsc::channel(32);
+    let (tx_temp, rx_temp) = mpsc::channel(32);
+
+    // COMMANDER -> ACTUATORS
+    let (at_tx_force, at_rx_force) = mpsc::channel(32);
+    let (at_tx_pos, at_rx_pos) = mpsc::channel(32);
+    let (at_tx_temp, at_rx_temp) = mpsc::channel(32);
+
+    // ACTUATORS -> SENSORS (Feedback Loop)
+    let (fb_tx_force, fb_rx_force) = mpsc::channel(32);
+    let (fb_tx_pos, fb_rx_pos) = mpsc::channel(32);
+    let (fb_tx_temp, fb_rx_temp) = mpsc::channel(32);
+
+    // Map needed for Commander initialization
+    let mut actuator_tx_map = HashMap::new();
+    actuator_tx_map.insert(SensorType::Force, at_tx_force);
+    actuator_tx_map.insert(SensorType::Position, at_tx_pos);
+    actuator_tx_map.insert(SensorType::Temperature, at_tx_temp);
+
+    // 3. Initialize Components
+    let sensor_force = SensorAsync::new(SensorType::Force, system_log.clone());
+    let sensor_pos = SensorAsync::new(SensorType::Position, system_log.clone());
+    let sensor_temp = SensorAsync::new(SensorType::Temperature, system_log.clone());
+
+    let commander = ActuatorCommanderAsync::new(actuator_tx_map, system_log.clone());
+
+    let actuator_force = ActuatorAsync::new("Gripper".to_string(), SensorType::Force, system_log.clone());
+    let actuator_pos = ActuatorAsync::new("Stabiliser".to_string(), SensorType::Position, system_log.clone());
+    let actuator_temp = ActuatorAsync::new("Cooling".to_string(), SensorType::Temperature, system_log.clone());
+
+    let start_time = std::time::Instant::now();
+
+    // 4. Spawn Async Tasks
+    // We use join handles to collect the stats at the end
+    let h_s_force = tokio::spawn(async move { sensor_force.run(tx_force, fb_rx_force).await });
+    let h_s_pos = tokio::spawn(async move { sensor_pos.run(tx_pos, fb_rx_pos).await });
+    let h_s_temp = tokio::spawn(async move { sensor_temp.run(tx_temp, fb_rx_temp).await });
+
+    let mut h_commander = tokio::spawn(async move { commander.run(rx_force, rx_pos, rx_temp).await });
+
+    let h_a_force = tokio::spawn(async move { actuator_force.run(at_rx_force, fb_tx_force).await });
+    let h_a_pos = tokio::spawn(async move { actuator_pos.run(at_rx_pos, fb_tx_pos).await });
+    let h_a_temp = tokio::spawn(async move { actuator_temp.run(at_rx_temp, fb_tx_temp).await });
+
+    // 5. Run Simulation Duration
+    println!("Simulation Running...");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    {
+        let mut log = system_log.lock().await;
+        log.active = false; // This tells everyone to break their loops
+        log.write("--- Stopping Simulation ---".to_string());
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let total_run_time = start_time.elapsed();
+
+    let temp_stats = h_s_force.await.unwrap();
+    let pos_stats = h_s_pos.await.unwrap();
+    let force_stats = h_s_temp.await.unwrap();
+
+    let commander_stats = h_commander.await.unwrap();
+    let motor_stats = h_a_force.await.unwrap();
+    let stabiliser_stats = h_a_pos.await.unwrap();
+    let gripper_stats = h_a_temp.await.unwrap();
+
+    benchmark_stats.merge(&temp_stats);
+    benchmark_stats.merge(&pos_stats);
+    benchmark_stats.merge(&force_stats);
+    benchmark_stats.merge(&commander_stats);
+    benchmark_stats.merge(&motor_stats);
+    benchmark_stats.merge(&stabiliser_stats);
+    benchmark_stats.merge(&gripper_stats);
+
+    println!("--- Simulation Finished (Async) ---");
+    // (In a real implementation, you would signal cancellation here to let threads return)
+    print_report(benchmark_stats, total_run_time);
+}
+
 // #[tokio::main]
 // async fn main() {
 //     println!("=== System Start ===");
@@ -81,69 +163,4 @@ fn main() {
 //     for entry in &log_guard.entries {
 //         println!("LOG: {}", entry);
 //     }
-// }
-
-
-
-// fn main(){
-// println!("--- Starting Real-Time Sensor Simulation ---");
-//
-// // 1. Setup Shared Resources
-// let (tx_force, rx_force) = unbounded();
-// let (tx_pos, rx_pos) = unbounded();
-// let (tx_temp, rx_temp) = unbounded();
-//
-// let (fb_tx_force, fb_rx_force) = unbounded();
-// let (fb_tx_pos, fb_rx_pos) = unbounded();
-// let (fb_tx_temp, fb_rx_temp) = unbounded();
-//
-// let mut feedback_map = HashMap::new();
-// feedback_map.insert(SensorType::Force, fb_tx_force);
-// feedback_map.insert(SensorType::Position, fb_tx_pos);
-// feedback_map.insert(SensorType::Temperature, fb_tx_temp);
-//
-// // 2. Define the Sensors we want to run
-// let sensors = vec![
-//     SensorType::Force,
-//     SensorType::Position,
-//     SensorType::Temperature,
-// ];
-//
-// let system_log = Arc::new(Mutex::new(SystemLog::new()));
-//
-// // 3. Spawn Threads for each Sensor
-// let spawn_sensor = |sType, tx, rx_fb, log| {
-// thread::spawn(move || {
-// let sensor = Sensor::new(sType);
-// // Sensor::run now takes rx_fb
-// sensor.run(tx, rx_fb, log);
-// });
-// };
-//
-// spawn_sensor(SensorType::Force, tx_force, fb_rx_force, system_log.clone());
-// spawn_sensor(SensorType::Position, tx_pos, fb_rx_pos, system_log.clone());
-// spawn_sensor(SensorType::Temperature, tx_temp, fb_rx_temp, system_log.clone());
-//
-// // 4. Run a Dummy Receiver (Actuator Placeholder)
-// // 4. Run Commander (Main Thread blocks here)
-// let commander_log = system_log.clone();
-// let commander = ActuatorCommander::new(feedback_map, commander_log);
-//
-// let commander_handle = thread::spawn(move || {
-// commander.run(rx_force, rx_pos, rx_temp);
-// });
-//
-// thread::sleep(Duration::from_secs(2));
-//
-// {
-// // Use the copy of system_log kept by main to signal shutdown
-// if let Ok(mut log) = system_log.lock() {
-// log.active = false; // This tells sensors to break their loop
-// }
-// }
-//
-// // Optional: Wait a tiny bit for threads to see the flag and clean up
-// thread::sleep(Duration::from_millis(1000));
-//
-// println!("--- Simulation Finished ---");
 // }

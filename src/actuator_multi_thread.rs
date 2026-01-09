@@ -4,7 +4,7 @@ use crossbeam::channel::{Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 use rand::Rng;
-use crate::share::{ActuatorStatus, BenchmarkStats, Feedback, SensorData, SensorFeedback, SensorType, SystemLog, SystemMode};
+use crate::share::{BenchmarkStats, Feedback, SensorData,SensorType, SystemLog};
 
 pub struct Actuator{
     name: String,
@@ -119,7 +119,9 @@ impl Actuator{
                 let _ = tx_status.send(feedback);
             }
             
+            let duration = start.elapsed();
             let now = Instant::now();
+            self.benchmark_stats.total_actuator_time += duration;
             let e2e_latency = now.duration_since(data.timestamp);
 
             self.benchmark_stats.total_latency += e2e_latency;

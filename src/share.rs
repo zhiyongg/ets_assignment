@@ -80,7 +80,7 @@ impl SystemLog {
             .create(true)
             .write(true)
             .truncate(true)
-            .open("simulation.log")
+            .open("system.log")
             .expect("Unable to open log file");
 
         Self {

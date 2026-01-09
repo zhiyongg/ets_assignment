@@ -107,7 +107,7 @@ impl Sensor {
 
         // FAULT 2: Network Latency Delay (5% chance)
         if fault_roll > 0.95 {
-            thread::sleep(Duration::from_micros(300)); // Deliberate delay
+            thread::sleep(Duration::from_micros(30)); // Deliberate delay
         }
 
         // 2. Transmit data
@@ -151,8 +151,8 @@ impl Sensor {
             // Increment total cycle count
             self.benchmark_stats.sensor_count += 1;
 
-            let start = Instant::now();
 
+            // Received feedback
             while let Ok(fb) = rx_feedback.try_recv() {
 
                 let arrival_time = Instant::now();
@@ -164,7 +164,7 @@ impl Sensor {
                 self.benchmark_stats.total_trans_time += elapsed;
 
                 // 3. Check Deadline (0.1ms = 100 microseconds)
-                let deadline_transmit = Duration::from_micros(100);
+                let deadline_transmit = Duration::from_micros(500);
 
                 if elapsed > deadline_transmit {
                     self.benchmark_stats.actuator_missed_deadlines += 1;

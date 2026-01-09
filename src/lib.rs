@@ -3,15 +3,19 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use crossbeam::channel::unbounded;
-mod share;
-mod sensor_multiThread;
-mod actuator_multiThread;
-mod actuatorCommander_multiThread;
 
-use crate::actuatorCommander_multiThread::ActuatorCommander;
-use crate::share::{BenchmarkStats, SensorType, SystemLog};
-use crate::sensor_multiThread::Sensor;
-use crate::actuator_multiThread::Actuator;
+pub mod share;
+pub mod sensor_multi_thread;
+pub mod actuator_multi_thread;
+pub mod actuator_commander_multi_thread;
+pub mod sensor_async;
+pub mod actuator_commander_async;
+pub mod actuator_async;
+
+pub use actuator_commander_multi_thread::ActuatorCommander;
+pub use share::{BenchmarkStats, SensorType, SystemLog};
+pub use sensor_multi_thread::Sensor;
+pub use actuator_multi_thread::Actuator;
 // use tokio::time::{self, Duration};
 
 pub fn run_simulation(duration: Duration) {
@@ -169,26 +173,27 @@ pub fn run_simulation(duration: Duration) {
 }
 
 pub fn print_report(benchmark_stats: BenchmarkStats, total_run_time: Duration){
+    println!("\n  Total Run Time:    {:.2?}", total_run_time);
     println!("\n===== Sensor Summary =====");
     println!("  Total Cycles:      {}", benchmark_stats.sensor_count);
     println!("  Throughput:        {:.2} pkts/sec", benchmark_stats.throughput(total_run_time));
     println!("  Missed Deadlines:  {} ({:.2}%)", benchmark_stats.sensor_missed_deadlines, benchmark_stats.sensor_deadline_rate());
-    println!("  Total Generation:  {:?}", benchmark_stats.total_gen_time);
-    println!("  Total Processing:  {:?}", benchmark_stats.total_proc_time);
-    println!("  Total Transmit:    {:?}", benchmark_stats.total_trans_time);
-    println!("  Avg Generation:    {:?}", benchmark_stats.avg_gen());
-    println!("  Avg Processing:    {:?}", benchmark_stats.avg_proc());
-    println!("  Avg Transmit:      {:?}", benchmark_stats.avg_trans());
-    println!("  Avg Jitter:        {:?} (Max: {:?})", benchmark_stats.avg_jitter(), benchmark_stats.max_jitter);
+    println!("  Total Generation:  {:.2?}", benchmark_stats.total_gen_time);
+    println!("  Total Processing:  {:.2?}", benchmark_stats.total_proc_time);
+    println!("  Total Transmit:    {:.2?}", benchmark_stats.total_trans_time);
+    println!("  Avg Generation:    {:.2?}", benchmark_stats.avg_gen());
+    println!("  Avg Processing:    {:.2?}", benchmark_stats.avg_proc());
+    println!("  Avg Transmit:      {:.2?}", benchmark_stats.avg_trans());
+    println!("  Avg Jitter:        {:.2?} (Max: {:?})", benchmark_stats.avg_jitter(), benchmark_stats.max_jitter);
 
     println!("\n===== Actuator Summary =====");
     println!("  Total Cycles:         {}", benchmark_stats.actuator_count);
     println!("  Throughput:           {:.2} pkts/sec", benchmark_stats.actuator_count as f64 / total_run_time.as_secs_f64());
     println!("  Missed Deadlines:     {} ({:.2}%)", benchmark_stats.actuator_missed_deadlines, benchmark_stats.actuator_deadline_rate());
-    println!("  Total Execution Time: {:?}", benchmark_stats.total_actuator_time);
-    println!("  Avg Execution Time:   {:?}", benchmark_stats.avg_actuator());
-    println!("  Total E2E Latency:    {:?}", benchmark_stats.total_latency);
-    println!("  Avg E2E Latency:      {:?}", benchmark_stats.avg_latency());
-    println!("  Avg Jitter:           {:?} (Max: {:?})", benchmark_stats.avg_at_jitter(),benchmark_stats.max_at_jitter);
+    println!("  Total Execution Time: {:.2?}", benchmark_stats.total_actuator_time);
+    println!("  Avg Execution Time:   {:.2?}", benchmark_stats.avg_actuator());
+    println!("  Total E2E Latency:    {:.2?}", benchmark_stats.total_latency);
+    println!("  Avg E2E Latency:      {:.2?}", benchmark_stats.avg_latency());
+    println!("  Avg Jitter:           {:.2?} (Max: {:?})", benchmark_stats.avg_at_jitter(),benchmark_stats.max_at_jitter);
 
 }
